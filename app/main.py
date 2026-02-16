@@ -1,6 +1,8 @@
 import os
 import logging
 from fastapi import FastAPI, Depends, HTTPException, Query
+from pydantic import BaseModel
+import uuid
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -229,6 +231,96 @@ def get_event_odds(sport: str, eventId: str, regions: str = "eu", markets: str =
     
     event_data["bookmakers"] = list(bookmakers_dict.values())
     return event_data
+
+class ResolveRequest(BaseModel):
+    home_team: str
+    away_team: str
+    commence_time: Optional[str] = None
+
+def _norm_name(s: str) -> str:
+    return ''.join(ch for ch in s.lower() if ch.isalnum())
+
+@app.post("/v4/sports/{sport}/events/resolve")
+def resolve_event(sport: str, req: ResolveRequest, refresh: bool = Query(True), db: Session = Depends(get_db)):
+    resolved = resolve_sport_key(sport)
+    sp = db.query(models.Sport).filter(models.Sport.key == resolved).first()
+    if not sp:
+        sp = models.Sport(key=resolved, group="Soccer", title=resolved, description=resolved)
+        db.add(sp)
+        db.commit()
+    for bkey, btitle in [("bet365", "Bet365"), ("betano", "Betano"), ("pinnacle", "Pinnacle")]:
+        if not db.query(models.Bookmaker).filter(models.Bookmaker.key == bkey).first():
+            db.add(models.Bookmaker(key=bkey, title=btitle))
+    db.commit()
+    hn = _norm_name(req.home_team)
+    an = _norm_name(req.away_team)
+    existing = None
+    for ev in db.query(models.Event).filter(models.Event.sport_key == resolved).all():
+        if _norm_name(ev.home_team) in hn or hn in _norm_name(ev.home_team):
+            if _norm_name(ev.away_team) in an or an in _norm_name(ev.away_team):
+                existing = ev
+                break
+    if not existing:
+        when = datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+        if req.commence_time:
+            try:
+                when = datetime.datetime.fromisoformat(req.commence_time.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                when = when
+        ev = models.Event(
+            id=str(uuid.uuid4()).replace("-", ""),
+            sport_key=resolved,
+            sport_title=sp.title,
+            commence_time=when,
+            home_team=req.home_team,
+            away_team=req.away_team,
+        )
+        db.add(ev)
+        db.commit()
+        existing = ev
+    if refresh:
+        try:
+            ensure_event_markets(db, existing)
+            db.commit()
+            db.refresh(existing)
+        except Exception:
+            db.rollback()
+    bookmakers_dict = {}
+    for odd in existing.odds:
+        if odd.bookmaker_key not in bookmakers_dict:
+            bookmakers_dict[odd.bookmaker_key] = {
+                "key": odd.bookmaker_key,
+                "title": odd.bookmaker_key.replace("_", " ").title(),
+                "last_update": odd.last_update.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "markets": []
+            }
+        market_found = False
+        for m in bookmakers_dict[odd.bookmaker_key]["markets"]:
+            if m["key"] == odd.market_key:
+                outcome = {"name": odd.outcome_name, "price": odd.price}
+                if odd.point is not None:
+                    outcome["point"] = odd.point
+                m["outcomes"].append(outcome)
+                market_found = True
+                break
+        if not market_found:
+            outcome = {"name": odd.outcome_name, "price": odd.price}
+            if odd.point is not None:
+                outcome["point"] = odd.point
+            bookmakers_dict[odd.bookmaker_key]["markets"].append({
+                "key": odd.market_key,
+                "last_update": odd.last_update.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "outcomes": [outcome]
+            })
+    return {
+        "id": existing.id,
+        "sport_key": existing.sport_key,
+        "sport_title": existing.sport_title,
+        "commence_time": existing.commence_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        "home_team": existing.home_team,
+        "away_team": existing.away_team,
+        "bookmakers": list(bookmakers_dict.values()),
+    }
 
 @app.get("/v4/historical/sports/{sport}/odds")
 def get_historical_odds(sport: str, date: str, db: Session = Depends(get_db)):
