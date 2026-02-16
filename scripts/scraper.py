@@ -26,11 +26,6 @@ def scrape_betexplorer():
         response = requests.get(url, headers=headers)
         soup = BeautifulSoup(response.content, 'html.parser')
         db = SessionLocal()
-        existing = db.query(models.Event).first()
-        if existing:
-            print("Dados já existem, pulando scrape.")
-            db.close()
-            return
         
         # Garantir que o esporte futebol exista
         soccer = db.query(models.Sport).filter(models.Sport.key == "soccer_epl").first()
@@ -55,38 +50,58 @@ def scrape_betexplorer():
         # Como o scraping real pode ser complexo devido ao JS, vamos simular a inserção de dados reais
         # extraídos do screenshot para garantir que a API tenha dados para mostrar.
         
-        matches = [
-            {"home": "Victoria", "away": "Olimpia", "h2h": [5.25, 3.80, 1.49], "time": datetime.datetime.now() + datetime.timedelta(hours=5)},
-            {"home": "Xelaju", "away": "Marquense", "h2h": [1.37, 4.10, 7.25], "time": datetime.datetime.now() + datetime.timedelta(hours=6)},
-            {"home": "Shamakhi", "away": "Turan Tovuz", "h2h": [3.20, 3.00, 2.10], "time": datetime.datetime.now() + datetime.timedelta(hours=14)}
-        ]
+        existing_count = db.query(models.Event).filter(models.Event.sport_key == "soccer_epl").count()
+        if existing_count == 0:
+            matches = [
+                {"home": "Victoria", "away": "Olimpia", "h2h": [5.25, 3.80, 1.49], "time": datetime.datetime.now() + datetime.timedelta(hours=5)},
+                {"home": "Xelaju", "away": "Marquense", "h2h": [1.37, 4.10, 7.25], "time": datetime.datetime.now() + datetime.timedelta(hours=6)},
+                {"home": "Shamakhi", "away": "Turan Tovuz", "h2h": [3.20, 3.00, 2.10], "time": datetime.datetime.now() + datetime.timedelta(hours=14)}
+            ]
 
-        for match in matches:
-            event_id = str(uuid.uuid4()).replace("-", "")
-            event = models.Event(
-                id=event_id,
-                sport_key="soccer_epl",
-                sport_title=soccer.title,
-                commence_time=match["time"],
-                home_team=match["home"],
-                away_team=match["away"]
-            )
-            db.add(event)
-            
-            # Adicionar Odds H2H
-            outcomes = [match["home"], "Draw", match["away"]]
-            for i, price in enumerate(match["h2h"]):
-                odd = models.Odd(
-                    event_id=event_id,
-                    bookmaker_key="bet365",
-                    market_key="h2h",
-                    outcome_name=outcomes[i],
-                    price=price
+            for match in matches:
+                event_id = str(uuid.uuid4()).replace("-", "")
+                event = models.Event(
+                    id=event_id,
+                    sport_key="soccer_epl",
+                    sport_title=soccer.title,
+                    commence_time=match["time"],
+                    home_team=match["home"],
+                    away_team=match["away"]
                 )
-                db.add(odd)
-        
+                db.add(event)
+                
+                outcomes = [match["home"], "Draw", match["away"]]
+                for i, price in enumerate(match["h2h"]):
+                    db.add(models.Odd(
+                        event_id=event_id,
+                        bookmaker_key="bet365",
+                        market_key="h2h",
+                        outcome_name=outcomes[i],
+                        price=price
+                    ))
+
+            db.commit()
+            print(f"Sucesso: {len(matches)} jogos inseridos.")
+
+        # Garantir spreads e totals para todos os eventos existentes
+        events = db.query(models.Event).filter(models.Event.sport_key == "soccer_epl").all()
+        added_markets = 0
+        for ev in events:
+            has_spreads = db.query(models.Odd).filter_by(event_id=ev.id, market_key="spreads").first() is not None
+            has_totals = db.query(models.Odd).filter_by(event_id=ev.id, market_key="totals").first() is not None
+
+            if not has_spreads:
+                db.add(models.Odd(event_id=ev.id, bookmaker_key="bet365", market_key="spreads", outcome_name=ev.home_team, price=1.90, point=-0.5))
+                db.add(models.Odd(event_id=ev.id, bookmaker_key="bet365", market_key="spreads", outcome_name=ev.away_team, price=1.90, point=0.5))
+                added_markets += 1
+
+            if not has_totals:
+                db.add(models.Odd(event_id=ev.id, bookmaker_key="bet365", market_key="totals", outcome_name="Over", price=1.95, point=2.5))
+                db.add(models.Odd(event_id=ev.id, bookmaker_key="bet365", market_key="totals", outcome_name="Under", price=1.85, point=2.5))
+                added_markets += 1
+
         db.commit()
-        print(f"Sucesso: {len(matches)} jogos inseridos.")
+        print(f"Mercados adicionais (spreads/totals) adicionados para {added_markets} conjunto(s) de mercados.")
         db.close()
         
     except Exception as e:
