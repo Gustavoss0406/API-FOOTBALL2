@@ -8,6 +8,7 @@ import datetime
 from . import models
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+from scripts.scraper import ensure_event_markets
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/odds.db")
 if DATABASE_URL.startswith("sqlite"):
@@ -44,6 +45,28 @@ def get_db():
     finally:
         db.close()
 
+# Map codes from football-data.org to internal sport keys
+FD_CODE_TO_INTERNAL = {
+    "PL": "soccer_epl",                      # Premier League
+    "PD": "soccer_spain_la_liga",           # Primera Division
+    "ELC": "soccer_efl_champ",              # Championship
+    "PPL": "soccer_portugal_primeira_liga", # Primeira Liga
+    "BL1": "soccer_germany_bundesliga",     # Bundesliga
+    "DED": "soccer_netherlands_eredivisie", # Eredivisie
+    "BSA": "soccer_brazil_campeonato",      # Brasileirão Série A
+    "SA": "soccer_italy_serie_a",           # Serie A
+    "FL1": "soccer_france_ligue_one",       # Ligue 1
+    "CL": "soccer_uefa_champs_league",      # UEFA Champions League
+    "EC": "soccer_uefa_europa_league",      # European Championship / Europa League mapping
+    "WC": "soccer_fifa_world_cup",          # FIFA World Cup (if present)
+}
+
+def resolve_sport_key(sport: str) -> str:
+    code = sport.upper()
+    if code in FD_CODE_TO_INTERNAL:
+        return FD_CODE_TO_INTERNAL[code]
+    return sport
+
 @app.get("/v4/sports")
 def get_sports(all: bool = False, db: Session = Depends(get_db)):
     sports = db.query(models.Sport).all()
@@ -67,7 +90,8 @@ def get_odds(
     oddsFormat: str = "decimal",
     db: Session = Depends(get_db)
 ):
-    events = db.query(models.Event).filter(models.Event.sport_key == sport).all()
+    resolved = resolve_sport_key(sport)
+    events = db.query(models.Event).filter(models.Event.sport_key == resolved).all()
     
     response = []
     for event in events:
@@ -120,7 +144,8 @@ def get_odds(
 
 @app.get("/v4/sports/{sport}/scores")
 def get_scores(sport: str, daysFrom: int = 3, db: Session = Depends(get_db)):
-    events = db.query(models.Event).filter(models.Event.sport_key == sport).all()
+    resolved = resolve_sport_key(sport)
+    events = db.query(models.Event).filter(models.Event.sport_key == resolved).all()
     response = []
     for event in events:
         score_data = {
@@ -148,10 +173,18 @@ def get_scores(sport: str, daysFrom: int = 3, db: Session = Depends(get_db)):
     return response
 
 @app.get("/v4/sports/{sport}/events/{eventId}/odds")
-def get_event_odds(sport: str, eventId: str, regions: str = "eu", markets: str = "h2h", db: Session = Depends(get_db)):
-    event = db.query(models.Event).filter(models.Event.id == eventId, models.Event.sport_key == sport).first()
+def get_event_odds(sport: str, eventId: str, regions: str = "eu", markets: str = "h2h", refresh: bool = Query(False), db: Session = Depends(get_db)):
+    resolved = resolve_sport_key(sport)
+    event = db.query(models.Event).filter(models.Event.id == eventId, models.Event.sport_key == resolved).first()
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
+    if refresh:
+        try:
+            ensure_event_markets(db, event)
+            db.commit()
+            db.refresh(event)
+        except Exception:
+            db.rollback()
     
     # Lógica de formatação idêntica ao endpoint de odds geral
     event_data = {
@@ -200,7 +233,8 @@ def get_event_odds(sport: str, eventId: str, regions: str = "eu", markets: str =
 @app.get("/v4/historical/sports/{sport}/odds")
 def get_historical_odds(sport: str, date: str, db: Session = Depends(get_db)):
     # Simulação de histórico retornando o estado atual para a data solicitada
-    data = get_odds(sport=sport, db=db)
+    resolved = resolve_sport_key(sport)
+    data = get_odds(sport=resolved, db=db)
     return {
         "timestamp": date, 
         "previous_timestamp": None, 
