@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: football-odds-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/scraper.py && gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:$PORT --workers ${WEB_CONCURRENCY:-2} --timeout 60
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        value: sqlite:///./data/odds.db
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CORS_ALLOW_ORIGINS
+        value: "*"
+      - key: WEB_CONCURRENCY
+        value: "2"
+    disk:
+      name: odds-data
+      mountPath: /app/data
+      sizeGB: 1
