@@ -1,6 +1,8 @@
 import os
 import logging
 import time
+import unicodedata
+import re
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from pydantic import BaseModel
 import uuid
@@ -694,8 +696,16 @@ def _parse_date_str(s: str) -> Optional[str]:
 
 def _find_event_by_names_on_date(date_str: str, home_name: str, away_name: str):
     ua = {"User-Agent": "Mozilla/5.0"}
-    hn = home_name.lower()
-    an = away_name.lower()
+    def _norm_str(s: str) -> str:
+        if not s:
+            return ""
+        s = unicodedata.normalize('NFD', s)
+        s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.lower()
+        s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+        return s
+    hn = _norm_str(home_name)
+    an = _norm_str(away_name)
     for code in CANDIDATE_LEAGUES:
         try:
             url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{code}/scoreboard?dates={date_str}"
@@ -703,7 +713,7 @@ def _find_event_by_names_on_date(date_str: str, home_name: str, away_name: str):
             for e in data.get("events", []):
                 comp = (e.get("competitions") or [{}])[0]
                 comps = comp.get("competitors", [])
-                names = [c.get("team", {}).get("displayName", "").lower() for c in comps]
+                names = [ _norm_str(c.get("team", {}).get("displayName", "")) for c in comps]
                 if any(hn in n or n in hn for n in names) and any(an in n or n in an for n in names):
                     # Build structured competitors preserving home/away
                     compo = []
@@ -734,6 +744,14 @@ def _find_event_by_names_around_date(date_str: str, home_name: str, away_name: s
 
 def _resolve_team_across_candidates(names: list[str]):
     found = {}
+    def _norm_str(s: str) -> str:
+        if not s:
+            return ""
+        s = unicodedata.normalize('NFD', s)
+        s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.lower()
+        s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+        return s
     for code in CANDIDATE_LEAGUES + ["esp.1", "por.1", "eng.1", "ita.1", "ger.1"]:
         try:
             tm = _espn_teams(code)
@@ -744,7 +762,7 @@ def _resolve_team_across_candidates(names: list[str]):
         except Exception:
             continue
         for name in names:
-            k = name.lower()
+            k = _norm_str(name)
             # direct match
             if k in tm and name not in found:
                 found[name] = tm[k]
@@ -755,7 +773,8 @@ def _resolve_team_across_candidates(names: list[str]):
                 continue
             # fuzzy
             for mk, mv in tm.items():
-                if k in mk or mk in k:
+                mk_norm = _norm_str(mk)
+                if k in mk_norm or mk_norm in k:
                     if name not in found:
                         found[name] = mv
                         try:
@@ -955,14 +974,19 @@ def _btts_over_rates(league_code: str, team_id: str, events: list[str], summarie
     return rates, n
 
 def _resolve_team_key(mapper: dict, team_id: str):
-    k = team_id.lower()
+    def _norm_str(s: str) -> str:
+        if not s:
+            return ""
+        s = unicodedata.normalize('NFD', s)
+        s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+        s = s.lower()
+        s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+        return s
+    k = _norm_str(team_id)
     if k in mapper:
         return mapper[k]
-    for guess in [k.replace("_", "-"), k.replace(" ", "-"), k.replace("as ", "as-"), k.replace("fc ", "fc-")]:
-        if guess in mapper:
-            return mapper[guess]
     for m in mapper.keys():
-        if k in m:
+        if k in _norm_str(m):
             return mapper[m]
     raise HTTPException(status_code=404, detail="team not found")
 
