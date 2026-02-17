@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from pydantic import BaseModel
 import uuid
@@ -61,9 +62,22 @@ FD_CODE_TO_INTERNAL = {
     "BSA": "soccer_brazil_campeonato",      # Brasileirão Série A
     "SA": "soccer_italy_serie_a",           # Serie A
     "FL1": "soccer_france_ligue_one",       # Ligue 1
-    "CL": "soccer_uefa_champs_league",      # UEFA Champions League
-    "EC": "soccer_uefa_europa_league",      # European Championship / Europa League mapping
+    "CL": "soccer_uefa_champs_league",
+    "EL": "soccer_uefa_europa_league",
+    "ECL": "soccer_uefa_europa_conference",
+    "EC": "soccer_uefa_euro_championship",
     "WC": "soccer_fifa_world_cup",          # FIFA World Cup (if present)
+    # Domestic cups
+    "FAC": "soccer_eng_fa_cup",
+    "EFL": "soccer_eng_efl_cup",
+    "CS": "soccer_eng_community_shield",
+    "CDR": "soccer_esp_copa_del_rey",
+    "COPPA": "soccer_ita_coppa_italia",
+    "DFB": "soccer_ger_dfb_pokal",
+    "COUPE": "soccer_fra_coupe",
+    "TACA": "soccer_por_taca_portugal",
+    "KNVB": "soccer_ned_knvb_beker",
+    "CBR": "soccer_bra_copa_do_brasil",
 }
 
 def resolve_sport_key(sport: str) -> str:
@@ -354,21 +368,35 @@ ESPN_LEAGUE = {
     "DED": "ned.1",  # Eredivisie
     "ELC": "eng.2",  # Championship
     "BSA": "bra.1",  # Campeonato Brasileiro Série A
-    "CL": "uefa.champions", # UEFA Champions League
-    "EC": "uefa.euro",      # European Championship (EURO)
-    "WC": "fifa.world",     # FIFA World Cup
+    "CL": "uefa.champions",
+    "EL": "uefa.europa",
+    "ECL": "uefa.europa.conf",
+    "EC": "uefa.euro",
+    "WC": "fifa.world",
+    "FAC": "eng.fa",
+    "EFL": "eng.efl",
+    "CS": "eng.community",
+    "CDR": "esp.copa_del_rey",
+    "COPPA": "ita.coppa_italia",
+    "DFB": "ger.dfb_pokal",
+    "COUPE": "fra.cup",
+    "TACA": "por.taca",
+    "KNVB": "ned.knvb_beker",
+    "CBR": "bra.cup",
 }
 
 CANDIDATE_LEAGUES = [
-    # international tournaments
     "fifa.world", "uefa.euro",
-    # UEFA club tournaments
     "uefa.champions", "uefa.europa", "uefa.europa.conf",
-    # top leagues we support
-    "eng.1", "eng.2",
-    "ita.1", "esp.1", "ger.1", "fra.1", "por.1", "ned.1", "bra.1",
-    # some domestic cups/supercups where applicable
-    "fra.cup", "fra.scup", "fra.sper"
+    "eng.1", "eng.2", "esp.1", "ita.1", "ger.1", "fra.1", "por.1", "ned.1", "bra.1",
+    "eng.fa", "eng.efl", "eng.community",
+    "esp.copa_del_rey",
+    "ita.coppa_italia",
+    "ger.dfb_pokal",
+    "fra.cup", "fra.scup", "fra.sper",
+    "ned.knvb_beker",
+    "por.taca",
+    "bra.cup",
 ]
 
 from typing import Optional
@@ -690,6 +718,20 @@ def _find_event_by_names_on_date(date_str: str, home_name: str, away_name: str):
             continue
     return None, None, None
 
+def _find_event_by_names_around_date(date_str: str, home_name: str, away_name: str, window_days: int = 1):
+    try:
+        base = datetime.datetime.strptime(date_str, "%Y%m%d").date()
+    except Exception:
+        return None, None, None
+    offs = list(range(-window_days, window_days + 1))
+    for d in offs:
+        t = base + datetime.timedelta(days=d)
+        ds = t.strftime('%Y%m%d')
+        dl, de, comp = _find_event_by_names_on_date(ds, home_name, away_name)
+        if dl and de and comp:
+            return dl, de, comp
+    return None, None, None
+
 def _resolve_team_across_candidates(names: list[str]):
     found = {}
     for code in CANDIDATE_LEAGUES + ["esp.1", "por.1", "eng.1", "ita.1", "ger.1"]:
@@ -961,6 +1003,16 @@ def match_insights(payload: dict = Body(...)):
                 if dl2 and de2 and comp2:
                     det_league, det_event = dl2, de2
                     for c in comp2:
+                        if c.get("homeAway") == "home":
+                            resolved_home = {"id": c.get("id"), "name": c.get("name")}
+                        elif c.get("homeAway") == "away":
+                            resolved_away = {"id": c.get("id"), "name": c.get("name")}
+            # As última tentativa por nomes ±1 dia
+            if not det_event:
+                dl3, de3, comp3 = _find_event_by_names_around_date(date_token, hn, an, window_days=1)
+                if dl3 and de3 and comp3:
+                    det_league, det_event = dl3, de3
+                    for c in comp3:
                         if c.get("homeAway") == "home":
                             resolved_home = {"id": c.get("id"), "name": c.get("name")}
                         elif c.get("homeAway") == "away":
