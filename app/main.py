@@ -338,17 +338,37 @@ def get_historical_odds(sport: str, date: str, db: Session = Depends(get_db)):
     }
 
 ESPN_LEAGUE = {
+    # legacy internal keys
     "soccer_france_ligue_one": "fra.1",
     "soccer_epl": "eng.1",
     "soccer_spain_la_liga": "esp.1",
     "soccer_italy_serie_a": "ita.1",
     "soccer_germany_bundesliga": "ger.1",
+    # Football-Data short codes
+    "PL": "eng.1",   # Premier League
+    "SA": "ita.1",   # Serie A
+    "PD": "esp.1",   # Primera Division (LaLiga)
+    "BL1": "ger.1",  # Bundesliga
+    "FL1": "fra.1",  # Ligue 1
+    "PPL": "por.1",  # Primeira Liga
+    "DED": "ned.1",  # Eredivisie
+    "ELC": "eng.2",  # Championship
+    "BSA": "bra.1",  # Campeonato Brasileiro Série A
+    "CL": "uefa.champions", # UEFA Champions League
+    "EC": "uefa.euro",      # European Championship (EURO)
+    "WC": "fifa.world",     # FIFA World Cup
 }
 
 CANDIDATE_LEAGUES = [
+    # international tournaments
+    "fifa.world", "uefa.euro",
+    # UEFA club tournaments
     "uefa.champions", "uefa.europa", "uefa.europa.conf",
-    "fra.1", "fra.cup", "fra.scup", "fra.sper",
-    "esp.1", "ita.1", "ger.1", "por.1"
+    # top leagues we support
+    "eng.1", "eng.2",
+    "ita.1", "esp.1", "ger.1", "fra.1", "por.1", "ned.1", "bra.1",
+    # some domestic cups/supercups where applicable
+    "fra.cup", "fra.scup", "fra.sper"
 ]
 
 from typing import Optional
@@ -405,9 +425,13 @@ def _espn_teams(league_code: str):
         except Exception:
             data = None
     if data is None:
-        raise HTTPException(status_code=502, detail="teams fetch failed")
+        return {}
     out = {}
-    for it in data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", []):
+    try:
+        teams_arr = data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
+    except Exception:
+        teams_arr = []
+    for it in teams_arr:
         t = it.get("team", {})
         slug = t.get("slug", "").lower()
         key = t.get("abbreviation", "").lower()
@@ -416,6 +440,23 @@ def _espn_teams(league_code: str):
         for k in {slug, key, name, short}:
             if k:
                 out[k] = {"id": t.get("id"), "name": t.get("displayName"), "slug": t.get("slug")}
+    if not out:
+        try:
+            ua = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(urls[0], headers=ua, timeout=INSIGHTS_HTTP_TIMEOUT)
+            if r.status_code == 200:
+                j = r.json()
+                for it in j.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", []):
+                    t = it.get("team", {})
+                    slug = t.get("slug", "").lower()
+                    key = t.get("abbreviation", "").lower()
+                    name = t.get("displayName", "").lower()
+                    short = t.get("shortDisplayName", "").lower()
+                    for k in {slug, key, name, short}:
+                        if k:
+                            out[k] = {"id": t.get("id"), "name": t.get("displayName"), "slug": t.get("slug")}
+        except Exception:
+            pass
     return out
 
 def _espn_last_events_ids(league_code: str, team_id: str, limit: int = 10):
@@ -649,6 +690,64 @@ def _find_event_by_names_on_date(date_str: str, home_name: str, away_name: str):
             continue
     return None, None, None
 
+def _resolve_team_across_candidates(names: list[str]):
+    found = {}
+    for code in CANDIDATE_LEAGUES + ["esp.1", "por.1", "eng.1", "ita.1", "ger.1"]:
+        try:
+            tm = _espn_teams(code)
+            try:
+                logging.warning(f"insights.cross scan code={code} teams={len(tm)}")
+            except Exception:
+                pass
+        except Exception:
+            continue
+        for name in names:
+            k = name.lower()
+            # direct match
+            if k in tm and name not in found:
+                found[name] = tm[k]
+                try:
+                    logging.warning(f"insights.cross direct name='{name}' code={code} -> id={found[name]['id']}")
+                except Exception:
+                    pass
+                continue
+            # fuzzy
+            for mk, mv in tm.items():
+                if k in mk or mk in k:
+                    if name not in found:
+                        found[name] = mv
+                        try:
+                            logging.warning(f"insights.cross fuzzy name='{name}' code={code} match='{mk}' id={mv.get('id')}")
+                        except Exception:
+                            pass
+                        break
+        if all(n in found for n in names):
+            break
+    return found
+
+def _find_event_on_date_by_ids(date_str: str, home_id: str, away_id: str):
+    ua = {"User-Agent": "Mozilla/5.0"}
+    for code in CANDIDATE_LEAGUES:
+        try:
+            url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{code}/scoreboard?dates={date_str}"
+            data = _fetch_json(url, headers=ua, ttl=60)
+            for e in data.get("events", []):
+                comp = (e.get("competitions") or [{}])[0]
+                comps = comp.get("competitors", [])
+                ids = [c.get("team", {}).get("id") for c in comps]
+                if str(home_id) in map(str, ids) and str(away_id) in map(str, ids):
+                    compo = []
+                    for c in comps:
+                        compo.append({
+                            "id": c.get("team", {}).get("id"),
+                            "name": c.get("team", {}).get("displayName"),
+                            "homeAway": c.get("homeAway")
+                        })
+                    return code, str(e.get("id")), compo
+        except Exception:
+            continue
+    return None, None, None
+
 def _team_stats_from_events(league_code: str, team_id: str, team_name_norm: str, events: list[str], summaries: Optional[dict] = None):
     goals_for = []
     goals_against = []
@@ -656,7 +755,8 @@ def _team_stats_from_events(league_code: str, team_id: str, team_name_norm: str,
     cards = []
     offsides = []
     wood = []
-    xg_vals = []
+    xg_for_vals = []
+    xg_against_vals = []
     form = []
     for eid in events:
         try:
@@ -685,6 +785,8 @@ def _team_stats_from_events(league_code: str, team_id: str, team_name_norm: str,
                 form.append("D")
             else:
                 form.append("L")
+        xg_self = None
+        xg_opp = None
         for tm in comps:
             nm = tm.get("team", {}).get("displayName", "").lower()
             statistics = tm.get("statistics", [])
@@ -702,7 +804,8 @@ def _team_stats_from_events(league_code: str, team_id: str, team_name_norm: str,
                             except Exception:
                                 return None
                 return None
-            if team_name_norm in nm or nm in team_name_norm:
+            is_self = team_name_norm in nm or nm in team_name_norm
+            if is_self:
                 c = get_stat({"wonCorners", "cornerKicks", "cornersWon"})
                 if c is not None:
                     corners.append(c)
@@ -715,9 +818,26 @@ def _team_stats_from_events(league_code: str, team_id: str, team_name_norm: str,
                 w = get_stat({"shotsOnWoodwork", "hitWoodwork"})
                 if w is not None:
                     wood.append(w)
-                xg = get_stat({"expectedGoals", "xg", "xG"})
-                if xg is not None:
-                    xg_vals.append(xg)
+                xg_self = get_stat({"expectedGoals", "xg", "xG"})
+            else:
+                # attempt to capture opponent xG
+                def get_stat_opp(keys: set[str]) -> Optional[float]:
+                    for st in statistics:
+                        name = st.get("name", "")
+                        if name in keys:
+                            try:
+                                return float(st.get("displayValue"))
+                            except Exception:
+                                try:
+                                    return float(st.get("value")) if st.get("value") is not None else None
+                                except Exception:
+                                    return None
+                    return None
+                xg_opp = get_stat_opp({"expectedGoals", "xg", "xG"})
+        if xg_self is not None:
+            xg_for_vals.append(xg_self)
+        if xg_opp is not None:
+            xg_against_vals.append(xg_opp)
     def avg(lst):
         return round(sum(lst) / len(lst), 2) if lst else None
     stats = {
@@ -728,8 +848,10 @@ def _team_stats_from_events(league_code: str, team_id: str, team_name_norm: str,
         "offsides_avg": avg(offsides),
         "woodwork_hit_avg": avg(wood),
     }
-    if xg_vals:
-        stats["xg_avg"] = avg(xg_vals)
+    if xg_for_vals:
+        stats["xg_for_avg"] = avg(xg_for_vals)
+    if xg_against_vals:
+        stats["xg_against_avg"] = avg(xg_against_vals)
     samples = {
         "goals_for_avg": {"n": len(goals_for), "sum": sum(goals_for)},
         "goals_against_avg": {"n": len(goals_against), "sum": sum(goals_against)},
@@ -738,8 +860,10 @@ def _team_stats_from_events(league_code: str, team_id: str, team_name_norm: str,
         "offsides_avg": {"n": len(offsides), "sum": sum(offsides)},
         "woodwork_hit_avg": {"n": len(wood), "sum": sum(wood)},
     }
-    if xg_vals:
-        samples["xg_avg"] = {"n": len(xg_vals), "sum": sum(xg_vals)}
+    if xg_for_vals:
+        samples["xg_for_avg"] = {"n": len(xg_for_vals), "sum": sum(xg_for_vals)}
+    if xg_against_vals:
+        samples["xg_against_avg"] = {"n": len(xg_against_vals), "sum": sum(xg_against_vals)}
     return stats, form[:5], samples
 
 def _h2h_events_for_teams(league_code: str, home_team_id: str, away_team_id: str, limit: int = 5):
@@ -828,22 +952,49 @@ def match_insights(payload: dict = Body(...)):
                     resolved_home = {"id": c.get("id"), "name": c.get("name")}
                 elif c.get("homeAway") == "away":
                     resolved_away = {"id": c.get("id"), "name": c.get("name")}
-        else:
-            # With an explicit date, fail fast if we can't find the exact event
-            raise HTTPException(status_code=404, detail="event not found for provided date and teams")
+        # If not found by names on the date, proceed to generic detection below
+        if not det_event:
+            # Try to resolve both teams across candidate leagues by name, then locate by ids on date
+            cross = _resolve_team_across_candidates([hn, an])
+            if hn in cross and an in cross:
+                dl2, de2, comp2 = _find_event_on_date_by_ids(date_token, cross[hn]["id"], cross[an]["id"])
+                if dl2 and de2 and comp2:
+                    det_league, det_event = dl2, de2
+                    for c in comp2:
+                        if c.get("homeAway") == "home":
+                            resolved_home = {"id": c.get("id"), "name": c.get("name")}
+                        elif c.get("homeAway") == "away":
+                            resolved_away = {"id": c.get("id"), "name": c.get("name")}
     # Resolve team ids/names
     if resolved_home and resolved_away:
         home_res = resolved_home
         away_res = resolved_away
         use_league = det_league or espn_league or "uefa.champions"
     else:
-        # If league not mapped, try across candidates later after resolving team ids
-        if not espn_league:
-            espn_league = "fra.1"
-        team_map = _espn_teams(espn_league)
-        home_res = _resolve_team_key(team_map, home_id)
-        away_res = _resolve_team_key(team_map, away_id)
-        use_league = espn_league
+        # Try cross-league resolution first to avoid league bias
+        hn = home.get("name") or str(home.get("id") or "")
+        an = away.get("name") or str(away.get("id") or "")
+        cross = _resolve_team_across_candidates([hn, an])
+        try:
+            logging.warning(f"insights.cross_resolution query hn='{hn}' an='{an}' -> keys={list(cross.keys())}")
+        except Exception:
+            pass
+        if hn in cross and an in cross:
+            home_res = cross[hn]
+            away_res = cross[an]
+            use_league = det_league or espn_league or "uefa.champions"
+        else:
+            # Fallback to league-bound teams list
+            if not espn_league:
+                espn_league = "fra.1"
+            team_map = _espn_teams(espn_league)
+            try:
+                logging.warning(f"insights.league_fallback league={espn_league} keys={list(team_map.keys())[:5]}")
+            except Exception:
+                pass
+            home_res = _resolve_team_key(team_map, home_id)
+            away_res = _resolve_team_key(team_map, away_id)
+            use_league = espn_league
     # Determine correct league/event for the next H2H if not already found via date
     if not det_event and payload.get("status") == "SCHEDULED":
         dl, de = _find_next_h2h_event(home_res.get("id"), away_res.get("id"))
@@ -877,6 +1028,7 @@ def match_insights(payload: dict = Body(...)):
     venue_val = None
     referee_name = None
     kickoff_val = None
+    lineup_info = None
     if det_event and det_league:
         try:
             s = _espn_event_summary(det_league, det_event)
@@ -887,6 +1039,33 @@ def match_insights(payload: dict = Body(...)):
                 referee_name = offs[0].get("displayName")
             hdr_comp = (s.get("header", {}).get("competitions") or [{}])[0]
             kickoff_val = hdr_comp.get("date") or kickoff_val
+            # lineups with positions when available
+            lns = s.get("lineups") or []
+            home_players = []
+            away_players = []
+            confirmed = False
+            for block in lns:
+                team = (block.get("team") or {})
+                tside = team.get("id")
+                confirmed = confirmed or bool(block.get("confirmed"))
+                def collect(pls):
+                    out = []
+                    for p in pls or []:
+                        ath = p.get("athlete") or {}
+                        pos = (p.get("position") or {}).get("abbreviation")
+                        out.append({
+                            "name": ath.get("displayName") or ath.get("shortName"),
+                            "pos": pos,
+                            "starter": bool(p.get("starter")),
+                        })
+                    return out
+                players = collect(block.get("starters")) + collect(block.get("substitutes"))
+                if str(tside) == str((resolved_home or {}).get("id") or home_res.get("id")):
+                    home_players.extend(players)
+                elif str(tside) == str((resolved_away or {}).get("id") or away_res.get("id")):
+                    away_players.extend(players)
+            if home_players or away_players:
+                lineup_info = {"confirmed": confirmed, "home_players": home_players, "away_players": away_players}
         except Exception:
             pass
     last_matches = []
@@ -945,32 +1124,68 @@ def match_insights(payload: dict = Body(...)):
     # choose final team identity: if event-resolved, use that to preserve true home/away
     final_home_name = (resolved_home or {}).get("name") or home.get("name") or home_res["name"]
     final_away_name = (resolved_away or {}).get("name") or away.get("name") or away_res["name"]
-    final_home_id = (resolved_home or {}).get("id") or home_id
-    final_away_id = (resolved_away or {}).get("id") or away_id
+    final_home_id = (resolved_home or {}).get("id") or str(home_res.get("id") or home_id)
+    final_away_id = (resolved_away or {}).get("id") or str(away_res.get("id") or away_id)
+    # standings (best effort)
+    standings_map = {}
+    try:
+        standings_map = _espn_standings(use_league)
+    except Exception:
+        standings_map = {}
+    # compute referee averages from cached summaries
+    ref_avg_cards = None
+    ref_avg_reds = None
+    if referee_name:
+        try:
+            ref_avg_cards, ref_avg_reds = _ref_avgs_from_summaries(referee_name, summaries_cache)
+        except Exception:
+            ref_avg_cards = ref_avg_reds = None
+    # attempt logos
+    league_logo_val = None
+    try:
+        league_logo_val = _league_logo(use_league, date_token, kickoff_val)
+    except Exception:
+        league_logo_val = None
+    home_logo_val = None
+    away_logo_val = None
+    try:
+        if det_event and det_league:
+            evsum = _espn_event_summary(det_league, det_event)
+            home_logo_val = _extract_team_logo_from_summary(evsum, (resolved_home or {}).get("id") or home_res.get("id"))
+            away_logo_val = _extract_team_logo_from_summary(evsum, (resolved_away or {}).get("id") or away_res.get("id"))
+    except Exception:
+        pass
     out = {
         "match_id": payload.get("match_id") or str(uuid.uuid4()).replace("-", ""),
         "status": payload.get("status") or "SCHEDULED",
         "meta": {
             "league": det_league or (league if league else use_league),
-            "venue": payload.get("meta", {}).get("venue") or venue_val or "",
+            "league_logo": league_logo_val,
+            "venue": payload.get("meta", {}).get("venue") or venue_val,
             "commence_time": kickoff_val,
-            "referee": {"name": referee_name} if referee_name else {},
+            "referee": ({"name": referee_name, "avg_cards": ref_avg_cards, "avg_reds": ref_avg_reds} if referee_name else {}),
         },
         "teams": {
             "home": {
                 "name": final_home_name,
                 "id": final_home_id,
+                "logo": home_logo_val,
+                "rank": (standings_map.get(str(final_home_id)) or {}).get("rank"),
+                "points": (standings_map.get(str(final_home_id)) or {}).get("points"),
                 "stats_season": home_stats_filled,
                 "form_last_5": home_form_out,
             },
             "away": {
                 "name": final_away_name,
                 "id": final_away_id,
+                "logo": away_logo_val,
+                "rank": (standings_map.get(str(final_away_id)) or {}).get("rank"),
+                "points": (standings_map.get(str(final_away_id)) or {}).get("points"),
                 "stats_season": away_stats_filled,
                 "form_last_5": away_form_out,
             },
         },
-        "lineups": payload.get("lineups") or {"confirmed": False, "home_players": [], "away_players": []},
+        "lineups": lineup_info or (payload.get("lineups") or {"confirmed": False, "home_players": [], "away_players": []}),
         "h2h": {
             "last_matches": last_matches,
             "btts_rate_percent": rates["btts_rate_percent"],
@@ -1067,3 +1282,135 @@ from requests.adapters import HTTPAdapter
 _SESSION = requests.Session()
 _SESSION.mount("https://", HTTPAdapter(pool_connections=20, pool_maxsize=20))
 _SESSION.mount("http://", HTTPAdapter(pool_connections=10, pool_maxsize=10))
+def _espn_standings(league_code: str):
+    # Best effort: cache for 10 minutes
+    urls = [
+        f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_code}/standings",
+        f"https://site.api.espn.com/apis/v2/sports/soccer/{league_code}/standings",
+    ]
+    data = None
+    for u in urls:
+        try:
+            data = _fetch_json(u, ttl=600)
+            break
+        except Exception:
+            data = None
+    if not data:
+        return {}
+    # Build a map team_id -> {rank, points}
+    table = {}
+    # ESPN returns children for groups/divisions; iterate all items
+    standings = data.get("children") or data.get("standings") or []
+    stack = list(standings)
+    while stack:
+        node = stack.pop(0)
+        # dive into nested
+        for k in ("children", "standings", "entries"):
+            if isinstance(node.get(k), list):
+                # If entries present, parse entries here
+                if k == "entries":
+                    for ent in node.get(k):
+                        team = (ent.get("team") or {})
+                        tid = str(team.get("id")) if team.get("id") is not None else None
+                        stats = ent.get("stats", [])
+                        rank = None
+                        pts = None
+                        for st in stats:
+                            abbr = st.get("abbreviation") or st.get("name")
+                            if (abbr or "").lower() in {"pts", "points"}:
+                                try:
+                                    pts = int(float(st.get("value")))
+                                except Exception:
+                                    pts = None
+                            if (abbr or "").lower() in {"rk", "rank"}:
+                                try:
+                                    rank = int(float(st.get("value")))
+                                except Exception:
+                                    rank = None
+                        if tid and (rank is not None or pts is not None):
+                            table[tid] = {"rank": rank, "points": pts}
+                else:
+                    stack.extend(node.get(k))
+    return table
+
+def _extract_team_logo_from_summary(summary: dict, team_id: str):
+    try:
+        comp = (summary.get("header", {}).get("competitions") or [{}])[0]
+        comps = comp.get("competitors", [])
+        for c in comps:
+            tid = str((c.get("team") or {}).get("id"))
+            if str(team_id) == tid:
+                t = c.get("team") or {}
+                logos = t.get("logos") or []
+                for lg in logos:
+                    href = lg.get("href")
+                    if href:
+                        return href
+                if t.get("logo"):
+                    return t.get("logo")
+    except Exception:
+        pass
+    return None
+
+def _league_logo(league_code: str, date_token: Optional[str] = None, kickoff_iso: Optional[str] = None):
+    try:
+        d = date_token
+        if not d and kickoff_iso:
+            d = _parse_date_str(kickoff_iso)
+        if not d:
+            d = datetime.datetime.utcnow().strftime('%Y%m%d')
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_code}/scoreboard?dates={d}"
+        data = _fetch_json(url, ttl=120)
+        leagues = data.get("leagues", [])
+        if leagues:
+            logos = leagues[0].get("logos") or []
+            for lg in logos:
+                href = lg.get("href")
+                if href:
+                    return href
+    except Exception:
+        pass
+    return None
+
+def _ref_avgs_from_summaries(ref_name: str, summaries: dict):
+    tot_cards = 0.0
+    tot_reds = 0.0
+    matches = 0
+    if not ref_name:
+        return None, None
+    for s in summaries.values():
+        gi = s.get("gameInfo") or {}
+        offs = gi.get("officials") or []
+        if not offs:
+            continue
+        name = (offs[0].get("displayName") or "").strip().lower()
+        if name != ref_name.strip().lower():
+            continue
+        comps = (s.get("boxscore") or {}).get("teams", [])
+        yc = 0.0
+        rc = 0.0
+        for tm in comps:
+            statistics = tm.get("statistics", [])
+            for st in statistics:
+                nm = st.get("name")
+                if nm == "yellowCards":
+                    try:
+                        yc += float(st.get("displayValue")) if st.get("displayValue") is not None else float(st.get("value"))
+                    except Exception:
+                        pass
+                elif nm == "redCards":
+                    try:
+                        rc += float(st.get("displayValue")) if st.get("displayValue") is not None else float(st.get("value"))
+                    except Exception:
+                        pass
+        tot_cards += yc + rc
+        tot_reds += rc
+        matches += 1
+    if matches == 0:
+        return None, None
+    return round(tot_cards / matches, 2), round(tot_reds / matches, 2)
+# temporary debug route to inspect ESPN teams availability
+@app.get("/__debug/teams/{code}")
+def _debug_teams(code: str):
+    tm = _espn_teams(code)
+    return {"count": len(tm), "sample": list(tm.keys())[:5]}
